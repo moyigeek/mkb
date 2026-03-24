@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use unicode_segmentation::UnicodeSegmentation;
 use walkdir::WalkDir;
@@ -23,6 +23,10 @@ enum Commands {
     New { title: String },
     /// 列出所有笔记
     List,
+    /// 编辑笔记
+    Edit { title: String },
+    /// 删除笔记
+    Delete { title: String },
     /// 同步并建立语义索引 (RAG 准备)
     Sync,
     /// 基于你的知识库提问 (RAG)
@@ -49,7 +53,8 @@ impl AiClient {
     fn from_env() -> Self {
         Self {
             api_key: std::env::var("AI_API_KEY").unwrap_or_else(|_| "ollama".into()),
-            base_url: std::env::var("AI_BASE_URL").unwrap_or_else(|_| "http://localhost:11434/v1".into()),
+            base_url: std::env::var("AI_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:11434/v1".into()),
             model_emb: std::env::var("AI_EMB_MODEL").unwrap_or_else(|_| "nomic-embed-text".into()),
             model_chat: std::env::var("AI_CHAT_MODEL").unwrap_or_else(|_| "llama3".into()),
         }
@@ -57,29 +62,42 @@ impl AiClient {
 
     async fn get_embedding(&self, text: &str) -> Result<Vec<f32>> {
         let client = reqwest::Client::new();
-        let res: serde_json::Value = client.post(format!("{}/embeddings", self.base_url))
+        let res: serde_json::Value = client
+            .post(format!("{}/embeddings", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({ "input": text, "model": &self.model_emb }))
-            .send().await?.json().await?;
-        
+            .send()
+            .await?
+            .json()
+            .await?;
+
         let vec = res["data"][0]["embedding"]
             .as_array()
             .ok_or(anyhow!("Failed to get embedding: {:?}", res))?
-            .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
         Ok(vec)
     }
 
     async fn chat(&self, prompt: &str) -> Result<String> {
         let client = reqwest::Client::new();
-        let res: serde_json::Value = client.post(format!("{}/chat/completions", self.base_url))
+        let res: serde_json::Value = client
+            .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({
                 "model": &self.model_chat,
                 "messages": [{"role": "user", "content": prompt}]
             }))
-            .send().await?.json().await?;
-        
-        Ok(res["choices"][0]["message"]["content"].as_str().unwrap_or("No response").to_string())
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        Ok(res["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("No response")
+            .to_string())
     }
 }
 
@@ -96,22 +114,24 @@ struct SemanticChunker;
 impl SemanticChunker {
     async fn chunk(text: &str, ai: &AiClient) -> Vec<String> {
         let sentences: Vec<&str> = text.unicode_sentences().filter(|s| s.len() > 5).collect();
-        if sentences.is_empty() { return vec![]; }
+        if sentences.is_empty() {
+            return vec![];
+        }
 
         let mut chunks = Vec::new();
         let mut current_chunk = sentences[0].to_string();
-        
+
         // 简单语义切分：比较相邻句子的相似度
         for i in 0..sentences.len() - 1 {
             let e1 = ai.get_embedding(sentences[i]).await.unwrap_or_default();
-            let e2 = ai.get_embedding(sentences[i+1]).await.unwrap_or_default();
-            
+            let e2 = ai.get_embedding(sentences[i + 1]).await.unwrap_or_default();
+
             if !e1.is_empty() && !e2.is_empty() && cosine_similarity(&e1, &e2) > 0.7 {
                 current_chunk.push_str(" ");
-                current_chunk.push_str(sentences[i+1]);
+                current_chunk.push_str(sentences[i + 1]);
             } else {
                 chunks.push(current_chunk);
-                current_chunk = sentences[i+1].to_string();
+                current_chunk = sentences[i + 1].to_string();
             }
         }
         chunks.push(current_chunk);
@@ -124,7 +144,9 @@ impl SemanticChunker {
 fn get_kb_dir() -> PathBuf {
     let mut path = dirs::home_dir().expect("Could not find home dir");
     path.push(".mkb");
-    if !path.exists() { fs::create_dir_all(&path).unwrap(); }
+    if !path.exists() {
+        fs::create_dir_all(&path).unwrap();
+    }
     path
 }
 
@@ -152,6 +174,23 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Edit { title } => {
+            let file_path = kb_dir.join(format!("{}.md", title));
+            if file_path.exists() {
+                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+                Command::new(editor).arg(file_path).status()?;
+            } else {
+                println!("{} does not exist.", file_path.display());
+            }
+        }
+        Commands::Delete { title } => {
+            let file_path = kb_dir.join(format!("{}.md", title));
+            if file_path.exists() {
+                fs::remove_file(file_path)?;
+            } else {
+                println!("{} does not exist.", file_path.display());
+            }
+        }
         Commands::Sync => {
             println!("🔄 Processing semantic chunks and embeddings...");
             let mut all_entries = Vec::new();
@@ -173,11 +212,13 @@ async fn main() -> Result<()> {
             println!("✅ Sync complete. {} chunks indexed.", all_entries.len());
         }
         Commands::Ask { question } => {
-            if !index_path.exists() { return Err(anyhow!("Please run 'sync' first.")); }
-            
+            if !index_path.exists() {
+                return Err(anyhow!("Please run 'sync' first."));
+            }
+
             let query_emb = ai.get_embedding(question).await?;
             let data: Vec<VecEntry> = serde_json::from_str(&fs::read_to_string(index_path)?)?;
-            
+
             let mut matches = data.clone();
             matches.sort_by(|a, b| {
                 let s_b = cosine_similarity(&query_emb, &b.embedding);
@@ -185,9 +226,17 @@ async fn main() -> Result<()> {
                 s_b.partial_cmp(&s_a).unwrap()
             });
 
-            let context = matches.iter().take(3).map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n---\n");
-            let prompt = format!("Context:\n{}\n\nQuestion: {}\nAnswer based only on context:", context, question);
-            
+            let context = matches
+                .iter()
+                .take(3)
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            let prompt = format!(
+                "Context:\n{}\n\nQuestion: {}\nAnswer based only on context:",
+                context, question
+            );
+
             println!("🤖 AI is thinking...");
             let answer = ai.chat(&prompt).await?;
             println!("\n{}\n{}", "Answer:".green().bold(), answer);
