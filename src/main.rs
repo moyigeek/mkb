@@ -3,12 +3,30 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::SystemTime;
 use unicode_segmentation::UnicodeSegmentation;
 use walkdir::WalkDir;
+
 // --- 数据结构 ---
+
+#[derive(Serialize, Deserialize)]
+struct FullIndex {
+    // 存储 文件名 -> 最后修改时间
+    metadata: HashMap<String, SystemTime>,
+    // 所有的向量分块
+    entries: Vec<VecEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct VecEntry {
+    path: String,
+    content: String,
+    embedding: Vec<f32>,
+}
 
 #[derive(Parser)]
 #[command(name = "mkb", about = "Rust Minimalist Knowledge Base with RAG", long_about = None)]
@@ -31,13 +49,6 @@ enum Commands {
     Sync,
     /// 基于你的知识库提问 (RAG)
     Ask { question: String },
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct VecEntry {
-    path: String,
-    content: String,
-    embedding: Vec<f32>,
 }
 
 // --- AI 客户端 (OpenAI/Ollama 兼容) ---
@@ -107,6 +118,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
     dot / (norm_a * norm_b)
 }
 
@@ -121,7 +133,6 @@ impl SemanticChunker {
         let mut chunks = Vec::new();
         let mut current_chunk = sentences[0].to_string();
 
-        // 简单语义切分：比较相邻句子的相似度
         for i in 0..sentences.len() - 1 {
             let e1 = ai.get_embedding(sentences[i]).await.unwrap_or_default();
             let e2 = ai.get_embedding(sentences[i + 1]).await.unwrap_or_default();
@@ -138,8 +149,6 @@ impl SemanticChunker {
         chunks
     }
 }
-
-// --- 业务逻辑 ---
 
 fn get_kb_dir() -> PathBuf {
     let mut path = dirs::home_dir().expect("Could not find home dir");
@@ -179,37 +188,85 @@ async fn main() -> Result<()> {
                 let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
                 Command::new(editor).arg(file_path).status()?;
             } else {
-                println!("{} does not exist.", file_path.display());
+                println!("{} does not exist.", file_path.display().to_string().red());
             }
         }
         Commands::Delete { title } => {
             let file_path = kb_dir.join(format!("{}.md", title));
             if file_path.exists() {
                 fs::remove_file(file_path)?;
+                println!("Deleted {}", title.yellow());
             } else {
-                println!("{} does not exist.", file_path.display());
+                println!("{} does not exist.", title.red());
             }
         }
         Commands::Sync => {
-            println!("🔄 Processing semantic chunks and embeddings...");
-            let mut all_entries = Vec::new();
+            let index_bin = kb_dir.join("index.bin");
+
+            // 1. 加载旧索引
+            let full_index = if index_bin.exists() {
+                let bin_data = fs::read(&index_bin)?;
+                bincode::deserialize::<FullIndex>(&bin_data).unwrap_or(FullIndex {
+                    metadata: HashMap::new(),
+                    entries: Vec::new(),
+                })
+            } else {
+                FullIndex {
+                    metadata: HashMap::new(),
+                    entries: Vec::new(),
+                }
+            };
+
+            println!("🔄 Checking for changes...");
+
+            let mut new_entries = Vec::new();
+            let mut updated_metadata = HashMap::new();
+
+            // 2. 遍历磁盘文件
             for entry in WalkDir::new(&kb_dir).into_iter().filter_map(|e| e.ok()) {
                 if entry.path().is_file() && entry.path().extension().map_or(false, |s| s == "md") {
+                    let path_str = entry.file_name().to_string_lossy().to_string();
+                    let mtime = entry.metadata()?.modified()?;
+
+                    // 增量检查
+                    if let Some(old_mtime) = full_index.metadata.get(&path_str) {
+                        if *old_mtime == mtime {
+                            println!("  - {} (unchanged)", path_str.dimmed());
+                            let old_chunks: Vec<VecEntry> = full_index.entries.iter()
+                                .filter(|e| e.path == path_str)
+                                .cloned()
+                                .collect();
+                            new_entries.extend(old_chunks);
+                            updated_metadata.insert(path_str, mtime);
+                            continue;
+                        }
+                    }
+
+                    // 更新或新增
+                    println!("  - {} (updating...)", path_str.yellow().bold());
                     let content = fs::read_to_string(entry.path())?;
                     let chunks = SemanticChunker::chunk(&content, &ai).await;
                     for chunk in chunks {
                         let embedding = ai.get_embedding(&chunk).await?;
-                        all_entries.push(VecEntry {
-                            path: entry.file_name().to_string_lossy().into(),
-                            content: chunk,
+                        new_entries.push(VecEntry {
+                            path: path_str.clone(),
+                            content: chunk, // 这里修复了之前的 chunk_content 错误
                             embedding,
                         });
                     }
+                    updated_metadata.insert(path_str, mtime);
                 }
             }
-            let encoded: Vec<u8> = bincode::serialize(&all_entries)?;
-            fs::write(kb_dir.join("index.bin"), encoded)?;
-            println!("✅ Sync complete. Binary index saved.");
+
+            // 3. 保存新索引
+            let new_full_index = FullIndex {
+                metadata: updated_metadata,
+                entries: new_entries,
+            };
+
+            let encoded = bincode::serialize(&new_full_index)?;
+            fs::write(index_bin, encoded)?;
+            println!("✅ Sync complete. Total chunks: {}", new_full_index.entries.len());
         }
         Commands::Ask { question } => {
             let index_bin = kb_dir.join("index.bin");
@@ -217,38 +274,29 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("Please run 'sync' first."));
             }
 
-            // 1. 获取问题向量
             let query_emb = ai.get_embedding(question).await?;
-
-            // 2. 加载二进制索引
             let bin_data = fs::read(index_bin)?;
-            let data: Vec<VecEntry> = bincode::deserialize(&bin_data)?;
-
-            // 3. 性能优化：先计算相似度，再排序
-            // 使用 rayon 并行计算所有分块的相似度，并存储为 (相似度, 索引) 的元组
-            let mut scores: Vec<(f32, &VecEntry)> = data
-                .par_iter() // 并行计算
+            let full_index: FullIndex = bincode::deserialize(&bin_data)?;
+            
+            // 性能优化：并行计算相似度
+            let mut scores: Vec<(f32, &VecEntry)> = full_index.entries
+                .par_iter()
                 .map(|entry| {
                     let sim = cosine_similarity(&query_emb, &entry.embedding);
                     (sim, entry)
                 })
                 .collect();
 
-            // 4. 对分值进行排序（从高到低）
-            // 注意：f32 没有实现 Ord，所以用 partial_cmp
+            // 排序并取 Top 3
             scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            // 5. 取前 3 个最相关的片段作为上下文
-            let context = scores
-                .iter()
-                .take(3)
+            let context = scores.iter().take(3)
                 .map(|(_sim, entry)| entry.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n---\n");
 
-            // 6. 构造 Prompt 并询问 AI
             let prompt = format!(
-                "Context:\n{}\n\nQuestion: {}\nAnswer based only on context:",
+                "Use the context to answer the question. Context:\n{}\n\nQuestion: {}",
                 context, question
             );
 
