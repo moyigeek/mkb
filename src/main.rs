@@ -1,13 +1,13 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use unicode_segmentation::UnicodeSegmentation;
 use walkdir::WalkDir;
-
 // --- 数据结构 ---
 
 #[derive(Parser)]
@@ -154,7 +154,6 @@ fn get_kb_dir() -> PathBuf {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let kb_dir = get_kb_dir();
-    let index_path = kb_dir.join("index.json");
     let ai = AiClient::from_env();
 
     match &cli.command {
@@ -208,30 +207,46 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            fs::write(index_path, serde_json::to_string(&all_entries)?)?;
-            println!("✅ Sync complete. {} chunks indexed.", all_entries.len());
+            let encoded: Vec<u8> = bincode::serialize(&all_entries)?;
+            fs::write(kb_dir.join("index.bin"), encoded)?;
+            println!("✅ Sync complete. Binary index saved.");
         }
         Commands::Ask { question } => {
-            if !index_path.exists() {
+            let index_bin = kb_dir.join("index.bin");
+            if !index_bin.exists() {
                 return Err(anyhow!("Please run 'sync' first."));
             }
 
+            // 1. 获取问题向量
             let query_emb = ai.get_embedding(question).await?;
-            let data: Vec<VecEntry> = serde_json::from_str(&fs::read_to_string(index_path)?)?;
 
-            let mut matches = data.clone();
-            matches.sort_by(|a, b| {
-                let s_b = cosine_similarity(&query_emb, &b.embedding);
-                let s_a = cosine_similarity(&query_emb, &a.embedding);
-                s_b.partial_cmp(&s_a).unwrap()
-            });
+            // 2. 加载二进制索引
+            let bin_data = fs::read(index_bin)?;
+            let data: Vec<VecEntry> = bincode::deserialize(&bin_data)?;
 
-            let context = matches
+            // 3. 性能优化：先计算相似度，再排序
+            // 使用 rayon 并行计算所有分块的相似度，并存储为 (相似度, 索引) 的元组
+            let mut scores: Vec<(f32, &VecEntry)> = data
+                .par_iter() // 并行计算
+                .map(|entry| {
+                    let sim = cosine_similarity(&query_emb, &entry.embedding);
+                    (sim, entry)
+                })
+                .collect();
+
+            // 4. 对分值进行排序（从高到低）
+            // 注意：f32 没有实现 Ord，所以用 partial_cmp
+            scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            // 5. 取前 3 个最相关的片段作为上下文
+            let context = scores
                 .iter()
                 .take(3)
-                .map(|m| m.content.as_str())
+                .map(|(_sim, entry)| entry.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n---\n");
+
+            // 6. 构造 Prompt 并询问 AI
             let prompt = format!(
                 "Context:\n{}\n\nQuestion: {}\nAnswer based only on context:",
                 context, question
